@@ -8,7 +8,7 @@ const cheerio = require('cheerio');
 
 const START_URL = 'https://books.toscrape.com';
 
-const CACHE_PATH = path.join(__dirname, '..', 'cache');
+const CACHE_PATH = path.join(__dirname, '.', 'cache');
 
 const options = {
     uri: START_URL,
