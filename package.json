@@ -16,11 +16,10 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "nodemon ./src/index.js"
+    "dev": "node ./src/index.js"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
-    "nodemon": "^3.1.14",
     "request-promise": "^4.2.6"
   }
 }

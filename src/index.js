@@ -81,7 +81,8 @@ async function getPage(url, pageNumber) {
     try {
         let pageUrl = START_URL;
 
-        const discoveredUrls = new Set();
+        let discoveredCount = 0;
+        const uniqueUrls = new Set();
 
         for (let pageNumber = 1; pageNumber <= 3; pageNumber++) {
             const html = await getPage(pageUrl, pageNumber);
@@ -92,17 +93,24 @@ async function getPage(url, pageNumber) {
                 const href = $(element).attr('href');
 
                 if (href) {
+                    discoveredCount++;
+
                     const absoluteUrl = new URL(href, pageUrl).href;
-                    discoveredUrls.add(absoluteUrl);
+                    uniqueUrls.add(absoluteUrl);
                 }
             });
+
+            const nextHref = $('li.next a').attr('href');
+
+            if (nextHref)
+                pageUrl = new URL(nextHref, pageUrl).href;
 
         }
         console.log(`catalogue_pages=3`);
 
-        console.log(`discovered=${discoveredUrls.size}`);
+        console.log(`discovered=${discoveredCount}`);
 
-        console.log(`unique_urls=${discoveredUrls.size}`);
+        console.log(`unique_urls=${uniqueUrls.size}`);
     }
     catch (err) {
         console.log(`Error: ${err.message}`);
