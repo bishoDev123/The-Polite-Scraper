@@ -2,10 +2,27 @@ const fs = require('fs');
 const path = require('path');
 const request = require('request-promise');
 const cheerio = require('cheerio');
+const { z } = require('zod');
 
 const START_URL = 'https://books.toscrape.com';
+
 const CACHE_PATH = path.join(__dirname, '.', 'cache');
-const DATA_CACHE_PATH = path.join(CACHE_PATH, 'books.json');
+const OUTPUT_PATH = path.join(__dirname, '.', 'output');
+
+const BOOKS_OUTPUT_PATH = path.join(OUTPUT_PATH, 'books.json');
+const ERRORS_OUTPUT_PATH = path.join(OUTPUT_PATH, 'errors.json');
+
+const BookSchema = z.object({
+    title: z.string(),
+    price: z.string(),
+    parsedPrice: z.number(),
+    availability: z.string(),
+    description: z.string().nullable(),
+    rating: z.string(),
+    product_url: z.string().url(),
+    source_page: z.string().url(),
+    fetched_at: z.string().datetime({ offset: true })
+});
 
 const options = {
     headers: {
@@ -22,7 +39,6 @@ function sleep(ms) {
 }
 
 async function getPage(url, cachePath) {
-    // Check cache first
     if (fs.existsSync(cachePath)) {
         const html = fs.readFileSync(cachePath, 'utf-8');
 
@@ -34,7 +50,6 @@ async function getPage(url, cachePath) {
         return html;
     }
 
-    // Be polite between requests
     await sleep(500);
 
     const response = await request({
@@ -61,13 +76,13 @@ async function getPage(url, cachePath) {
     return html;
 }
 
-async function scrapeBook(url, bookNumber) {
+async function scrapeBook(productUrl, bookNumber) {
     const cachePath = path.join(
         CACHE_PATH,
         `book-${bookNumber}.html`
     );
 
-    const html = await getPage(url, cachePath);
+    const html = await getPage(productUrl, cachePath);
     const $ = cheerio.load(html);
 
     const title = $('div.product_main h1')
@@ -78,11 +93,17 @@ async function scrapeBook(url, bookNumber) {
         .text()
         .trim();
 
+    const cleanedPrice = price.replace(/[^0-9.-]+/g, '');
+    const parsedPrice = Number.parseFloat(cleanedPrice);
+
     const availability = $('div.product_main p.instock.availability')
         .text()
         .trim();
 
-    const ratingClasses = $('p.star-rating').attr('class').split(' ');
+    const ratingClasses = $('p.star-rating')
+        .attr('class')
+        .split(' ');
+
     const rating = ratingClasses[1];
 
     const descriptionElement = $('#product_description').next('p');
@@ -94,10 +115,11 @@ async function scrapeBook(url, bookNumber) {
     return {
         title,
         price,
+        parsedPrice,
         availability,
         description,
         rating,
-        url
+        product_url: productUrl
     };
 }
 
@@ -106,7 +128,10 @@ async function scrapeBook(url, bookNumber) {
         let pageUrl = START_URL;
 
         const uniqueUrls = new Map();
-        const books = [];
+
+        const books = new Map();
+
+        const errors = [];
 
         for (let pageNumber = 1; pageNumber <= 3; pageNumber++) {
             const cachePath = path.join(
@@ -128,7 +153,7 @@ async function scrapeBook(url, bookNumber) {
 
                     if (!uniqueUrls.has(absoluteUrl)) {
                         uniqueUrls.set(absoluteUrl, {
-                            url: absoluteUrl,
+                            product_url: absoluteUrl,
                             source_page: pageUrl
                         });
                     }
@@ -151,33 +176,61 @@ async function scrapeBook(url, bookNumber) {
         let bookNumber = 1;
 
         for (const bookInfo of uniqueUrls.values()) {
-            const book = await scrapeBook(
-                bookInfo.url,
-                bookNumber
-            );
+            try {
+                const book = await scrapeBook(
+                    bookInfo.product_url,
+                    bookNumber
+                );
 
-            const fetchedAt = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+                const fetchedAt = new Date().toISOString();
 
-            books.push({
-                ...book,
-                source_page: bookInfo.source_page,
-                fetched_at: fetchedAt
-            });
+                const record = {
+                    ...book,
+                    source_page: bookInfo.source_page,
+                    fetched_at: fetchedAt
+                };
+
+                const result = BookSchema.safeParse(record);
+
+                if (result.success) {
+                    books.set(
+                        result.data.product_url,
+                        result.data
+                    );
+                } else {
+                    errors.push({
+                        product_url: bookInfo.product_url,
+                        reason: result.error.issues
+                    });
+                }
+            } catch (err) {
+                errors.push({
+                    product_url: bookInfo.product_url,
+                    reason: err.message
+                });
+            }
 
             bookNumber++;
         }
 
-        fs.mkdirSync(CACHE_PATH, { recursive: true });
+        fs.mkdirSync(OUTPUT_PATH, { recursive: true });
 
         fs.writeFileSync(
-            DATA_CACHE_PATH,
-            JSON.stringify(books, null, 2),
+            BOOKS_OUTPUT_PATH,
+            JSON.stringify([...books.values()], null, 2),
             'utf-8'
         );
 
-        console.log(`books_scraped=${books.length}`);
-        console.log(`Data cached to: ${DATA_CACHE_PATH}`);
+        fs.writeFileSync(
+            ERRORS_OUTPUT_PATH,
+            JSON.stringify(errors, null, 2),
+            'utf-8'
+        );
 
+        console.log(`books_scraped=${books.size}`);
+        console.log(`errors=${errors.length}`);
+        console.log(`Books written to: ${BOOKS_OUTPUT_PATH}`);
+        console.log(`Errors written to: ${ERRORS_OUTPUT_PATH}`);
     } catch (err) {
         console.log(`Error: ${err.message}`);
         process.exit(1);
