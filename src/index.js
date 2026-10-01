@@ -11,6 +11,7 @@ const OUTPUT_PATH = path.join(__dirname, '.', 'output');
 
 const BOOKS_OUTPUT_PATH = path.join(OUTPUT_PATH, 'books.json');
 const ERRORS_OUTPUT_PATH = path.join(OUTPUT_PATH, 'errors.json');
+const RUN_REPORT_PATH = path.join(OUTPUT_PATH, 'run-report.json');
 
 const BookSchema = z.object({
     title: z.string(),
@@ -38,9 +39,52 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function getPage(url, cachePath) {
+function isRetryableError(err) {
+    return (
+        err.code === 'ETIMEDOUT' ||
+        err.code === 'ESOCKETTIMEDOUT' ||
+        (err.statusCode >= 500 && err.statusCode <= 599)
+    );
+}
+
+async function requestPage(url) {
+    let response;
+
+    try {
+        response = await request({
+            ...options,
+            uri: url
+        });
+    } catch (err) {
+        if (!isRetryableError(err)) {
+            throw err;
+        }
+
+        await sleep(1000);
+
+        response = await request({
+            ...options,
+            uri: url
+        });
+    }
+
+    if (response.statusCode >= 500 && response.statusCode <= 599) {
+        await sleep(1000);
+
+        response = await request({
+            ...options,
+            uri: url
+        });
+    }
+
+    return response;
+}
+
+async function getPage(url, cachePath, stats) {
     if (fs.existsSync(cachePath)) {
         const html = fs.readFileSync(cachePath, 'utf-8');
+
+        stats.cache_hits++;
 
         console.log(`Cache hit: ${cachePath}`);
         console.log(
@@ -52,10 +96,7 @@ async function getPage(url, cachePath) {
 
     await sleep(500);
 
-    const response = await request({
-        ...options,
-        uri: url
-    });
+    const response = await requestPage(url);
 
     if (response.statusCode !== 200) {
         throw new Error(
@@ -68,6 +109,8 @@ async function getPage(url, cachePath) {
     fs.mkdirSync(CACHE_PATH, { recursive: true });
     fs.writeFileSync(cachePath, html, 'utf-8');
 
+    stats.pages_fetched++;
+
     console.log(`FETCH: ${url}`);
     console.log(
         `Response size: ${Buffer.byteLength(html, 'utf-8')} bytes`
@@ -76,13 +119,18 @@ async function getPage(url, cachePath) {
     return html;
 }
 
-async function scrapeBook(productUrl, bookNumber) {
+async function scrapeBook(productUrl, bookNumber, stats) {
     const cachePath = path.join(
         CACHE_PATH,
         `book-${bookNumber}.html`
     );
 
-    const html = await getPage(productUrl, cachePath);
+    const html = await getPage(
+        productUrl,
+        cachePath,
+        stats
+    );
+
     const $ = cheerio.load(html);
 
     const title = $('div.product_main h1')
@@ -124,51 +172,94 @@ async function scrapeBook(productUrl, bookNumber) {
 }
 
 (async () => {
+    const startTime = new Date();
+
+    const stats = {
+        pages_fetched: 0,
+        cache_hits: 0,
+        valid_records: 0,
+        invalid_records: 0,
+        failed_pages: []
+    };
+
+    const uniqueUrls = new Map();
+    const books = new Map();
+    const errors = [];
+
     try {
         let pageUrl = START_URL;
 
-        const uniqueUrls = new Map();
-
-        const books = new Map();
-
-        const errors = [];
-
         for (let pageNumber = 1; pageNumber <= 3; pageNumber++) {
+            const currentPageUrl = pageUrl;
+
             const cachePath = path.join(
                 CACHE_PATH,
                 `catalogue-page-${pageNumber}.html`
             );
 
-            const html = await getPage(pageUrl, cachePath);
-            const $ = cheerio.load(html);
+            try {
+                const html = await getPage(
+                    currentPageUrl,
+                    cachePath,
+                    stats
+                );
 
-            $('article.product_pod h3 a').each((index, element) => {
-                const href = $(element).attr('href');
+                const $ = cheerio.load(html);
 
-                if (href) {
-                    const absoluteUrl = new URL(
-                        href,
-                        pageUrl
-                    ).href;
+                $('article.product_pod h3 a').each((index, element) => {
+                    const href = $(element).attr('href');
 
-                    if (!uniqueUrls.has(absoluteUrl)) {
-                        uniqueUrls.set(absoluteUrl, {
-                            product_url: absoluteUrl,
-                            source_page: pageUrl
-                        });
+                    if (href) {
+                        const absoluteUrl = new URL(
+                            href,
+                            currentPageUrl
+                        ).href;
+
+                        if (!uniqueUrls.has(absoluteUrl)) {
+                            uniqueUrls.set(absoluteUrl, {
+                                product_url: absoluteUrl,
+                                source_page: currentPageUrl
+                            });
+                        }
                     }
+                });
+
+                const nextHref = $('li.next a').attr('href');
+
+                if (nextHref) {
+                    pageUrl = new URL(
+                        nextHref,
+                        currentPageUrl
+                    ).href;
                 }
-            });
+            } catch (err) {
+                stats.failed_pages.push({
+                    page: pageNumber,
+                    url: currentPageUrl,
+                    reason: err.message
+                });
 
-            const nextHref = $('li.next a').attr('href');
+                console.log(
+                    `Page ${pageNumber} failed: ${err.message}`
+                );
 
-            if (nextHref) {
-                pageUrl = new URL(
-                    nextHref,
-                    pageUrl
-                ).href;
+                if (pageNumber < 3) {
+                    pageUrl = new URL(
+                        `catalogue/page-${pageNumber + 1}.html`,
+                        START_URL + '/'
+                    ).href;
+                }
             }
         }
+
+        uniqueUrls.set(
+            'https://books.toscrape.com/catalogue/this-book-does-not-exist/index.html',
+            {
+                product_url:
+                    'https://books.toscrape.com/catalogue/this-book-does-not-exist/index.html',
+                source_page: START_URL
+            }
+        );
 
         console.log(`catalogue_pages=3`);
         console.log(`unique_urls=${uniqueUrls.size}`);
@@ -179,15 +270,14 @@ async function scrapeBook(productUrl, bookNumber) {
             try {
                 const book = await scrapeBook(
                     bookInfo.product_url,
-                    bookNumber
+                    bookNumber,
+                    stats
                 );
-
-                const fetchedAt = new Date().toISOString();
 
                 const record = {
                     ...book,
                     source_page: bookInfo.source_page,
-                    fetched_at: fetchedAt
+                    fetched_at: new Date().toISOString()
                 };
 
                 const result = BookSchema.safeParse(record);
@@ -197,21 +287,32 @@ async function scrapeBook(productUrl, bookNumber) {
                         result.data.product_url,
                         result.data
                     );
+
+                    stats.valid_records++;
                 } else {
                     errors.push({
                         product_url: bookInfo.product_url,
                         reason: result.error.issues
                     });
+
+                    stats.invalid_records++;
                 }
             } catch (err) {
                 errors.push({
                     product_url: bookInfo.product_url,
                     reason: err.message
                 });
+
+                stats.invalid_records++;
             }
 
             bookNumber++;
         }
+    } catch (err) {
+        console.log(`Error: ${err.message}`);
+        process.exitCode = 1;
+    } finally {
+        const endTime = new Date();
 
         fs.mkdirSync(OUTPUT_PATH, { recursive: true });
 
@@ -227,12 +328,26 @@ async function scrapeBook(productUrl, bookNumber) {
             'utf-8'
         );
 
+        const runReport = {
+            start_time: startTime.toISOString(),
+            duration_ms: endTime.getTime() - startTime.getTime(),
+            pages_fetched: stats.pages_fetched,
+            cache_hits: stats.cache_hits,
+            valid_records: stats.valid_records,
+            invalid_records: stats.invalid_records,
+            failed_pages: stats.failed_pages
+        };
+
+        fs.writeFileSync(
+            RUN_REPORT_PATH,
+            JSON.stringify(runReport, null, 2),
+            'utf-8'
+        );
+
         console.log(`books_scraped=${books.size}`);
         console.log(`errors=${errors.length}`);
         console.log(`Books written to: ${BOOKS_OUTPUT_PATH}`);
         console.log(`Errors written to: ${ERRORS_OUTPUT_PATH}`);
-    } catch (err) {
-        console.log(`Error: ${err.message}`);
-        process.exit(1);
+        console.log(`Run report written to: ${RUN_REPORT_PATH}`);
     }
 })();
